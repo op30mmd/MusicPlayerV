@@ -22,6 +22,44 @@ static std::wstring Utf8ToWide(const std::string& utf8)
 	return out;
 }
 
+static std::string WideToUtf8(const std::wstring& wide)
+{
+	if (wide.empty()) return std::string();
+	int len = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), (int)wide.size(), nullptr, 0, nullptr, nullptr);
+	if (len <= 0) return std::string();
+	std::string out;
+	out.resize(len);
+	WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), (int)wide.size(), &out[0], len, nullptr, nullptr);
+	return out;
+}
+
+static std::string ReadTextFile(const std::wstring& path)
+{
+	HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (h == INVALID_HANDLE_VALUE) return std::string();
+	DWORD size = GetFileSize(h, nullptr);
+	std::string data;
+	if (size > 0)
+	{
+		data.resize(size);
+		DWORD read = 0;
+		if (!ReadFile(h, &data[0], size, &read, nullptr) || read != size)
+			data.clear();
+	}
+	CloseHandle(h);
+	return data;
+}
+
+static bool WriteTextFile(const std::wstring& path, const std::string& text)
+{
+	HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (h == INVALID_HANDLE_VALUE) return false;
+	DWORD written = 0;
+	bool ok = text.empty() || (WriteFile(h, text.data(), (DWORD)text.size(), &written, nullptr) && written == text.size());
+	CloseHandle(h);
+	return ok;
+}
+
 static std::wstring TrimQuotesWhitespace(const std::wstring& in)
 {
 	size_t start = 0;
@@ -191,6 +229,9 @@ bool YouTubeManager::Initialize(const std::wstring& exeDir, const std::wstring& 
 	if (GetFileAttributesW((exeDir + L"cookies.txt").c_str()) != INVALID_FILE_ATTRIBUTES)
 		m_cookiesPath = exeDir + L"cookies.txt";
 
+	m_cachePath = exeDir + L"MusicPlayerCache.txt";
+	LoadCacheFile();
+
 	if (!FindYtDlpExe(exeDir))
 	{
 		LogMessage(L"YouTube: yt-dlp.exe NOT found (looked next to .asi and in PATH). Put yt-dlp.exe next to MusicPlayer.asi");
@@ -243,7 +284,57 @@ void YouTubeManager::Shutdown()
 	{
 		std::lock_guard<std::mutex> lock(m_mutex);
 		m_results.clear();
+		m_dlQueue.clear();
 	}
+}
+
+void YouTubeManager::LoadCacheFile()
+{
+	m_cache.clear();
+	std::string data = ReadTextFile(m_cachePath);
+	size_t pos = 0;
+	while (pos < data.size())
+	{
+		size_t eol = data.find('\n', pos);
+		std::string line = data.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
+		pos = (eol == std::string::npos) ? data.size() : eol + 1;
+		if (!line.empty() && line.back() == '\r') line.pop_back();
+		size_t tab = line.find('\t');
+		if (tab == std::string::npos) continue;
+		std::wstring url = Utf8ToWide(line.substr(0, tab));
+		std::wstring file = Utf8ToWide(line.substr(tab + 1));
+		if (url.empty() || file.empty()) continue;
+		if (GetFileAttributesW(file.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+		m_cache.push_back({ url, file });
+	}
+	LogMessage(L"YouTube: cache loaded %d entries from %s", (int)m_cache.size(), m_cachePath.c_str());
+}
+
+void YouTubeManager::SaveCacheListLocked()
+{
+	if (m_cachePath.empty()) return;
+
+	std::vector<CacheEntry> kept;
+	kept.reserve(m_cache.size());
+	for (const CacheEntry& e : m_cache)
+	{
+		if (GetFileAttributesW(e.filePath.c_str()) != INVALID_FILE_ATTRIBUTES)
+			kept.push_back(e);
+	}
+	m_cache = std::move(kept);
+	if (m_cache.size() > 512)
+		m_cache.erase(m_cache.begin(), m_cache.begin() + (m_cache.size() - 512));
+
+	std::string out;
+	for (const CacheEntry& e : m_cache)
+	{
+		out += WideToUtf8(e.url);
+		out += '\t';
+		out += WideToUtf8(e.filePath);
+		out += "\r\n";
+	}
+	WriteTextFile(m_cachePath, out);
+	LogMessage(L"YouTube: cache saved %d entries", (int)m_cache.size());
 }
 
 bool YouTubeManager::FindYtDlpExe(const std::wstring& exeDir)
@@ -276,18 +367,103 @@ bool YouTubeManager::FindYtDlpExe(const std::wstring& exeDir)
 bool YouTubeManager::StartDownload(const std::wstring& url)
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
-	if (m_busy || !m_thread.joinable()) return false;
-	m_pendingUrl = url;
-	m_busy = true;
-	SetStatusLocked(L"Downloading...");
-	m_cv.notify_all();
-	return true;
+	if (!m_thread.joinable()) return false;
+
+	// Content cache: serve a previously downloaded file without re-downloading
+	size_t stale = (size_t)-1;
+	for (size_t i = 0; i < m_cache.size(); i++)
+	{
+		if (m_cache[i].url != url) continue;
+		if (GetFileAttributesW(m_cache[i].filePath.c_str()) != INVALID_FILE_ATTRIBUTES)
+		{
+			YtDownload res;
+			res.ok = true;
+			res.url = url;
+			res.filePath = m_cache[i].filePath;
+			size_t pos = res.filePath.find_last_of(L"\\/");
+			res.title = (pos == std::wstring::npos) ? res.filePath : res.filePath.substr(pos + 1);
+			m_results.push_back(res);
+			SetStatusLocked(L"Cached: ");
+			m_status += res.title;
+			LogMessage(L"YouTube: cache hit %s", res.filePath.c_str());
+			return true;
+		}
+		stale = i;
+		break;
+	}
+	if (stale != (size_t)-1 && m_cache.size() > 8)
+	{
+		m_cache.erase(m_cache.begin() + stale);
+	}
+
+	if (!m_busy)
+	{
+		m_pendingUrl = url;
+		m_busy = true;
+		SetStatusLocked(L"Downloading...");
+		m_cv.notify_all();
+		return true;
+	}
+	// A download is already running: chain the URL and process it next
+	if (m_dlQueue.size() < 64)
+	{
+		m_dlQueue.push_back(url);
+		return true;
+	}
+	return false;
+}
+
+bool YouTubeManager::FindScrapeCacheLocked(const std::wstring& key, bool isHome, std::vector<YtTrack>& out)
+{
+	ULONGLONG now = GetTickCount64();
+	ULONGLONG ttl = isHome ? 10ull * 60 * 1000 : 30ull * 60 * 1000;
+	for (const ScrapeCacheEntry& e : m_scrapeCache)
+	{
+		if (e.key != key || e.isHome != isHome) continue;
+		if (now < e.storedTick || now - e.storedTick > ttl) continue;
+		out = e.tracks;
+		return true;
+	}
+	return false;
+}
+
+void YouTubeManager::AddScrapeCacheLocked(const std::wstring& key, bool isHome, std::vector<YtTrack> tracks)
+{
+	if (key.empty() || tracks.empty()) return;
+	ULONGLONG now = GetTickCount64();
+	for (ScrapeCacheEntry& e : m_scrapeCache)
+	{
+		if (e.key == key && e.isHome == isHome)
+		{
+			e.storedTick = now;
+			e.tracks = std::move(tracks);
+			return;
+		}
+	}
+	if (m_scrapeCache.size() >= 32)
+		m_scrapeCache.erase(m_scrapeCache.begin());
+	m_scrapeCache.push_back({ key, isHome, now, std::move(tracks) });
 }
 
 bool YouTubeManager::ScrapePlaylist(const std::wstring& url)
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
 	if (m_scrapePending || m_homePending || !m_thread.joinable()) return false;
+
+	// scrape cache: return a recently scraped result without re-running node
+	std::vector<YtTrack> cachedTracks;
+	if (FindScrapeCacheLocked(url, false, cachedTracks))
+	{
+		m_scrapeResultReady = true;
+		m_browseTracks = std::move(cachedTracks);
+		m_scrapeError.clear();
+		wchar_t buf[64];
+		wsprintfW(buf, L"Cached: %d tracks", (int)m_browseTracks.size());
+		SetStatusLocked(buf);
+		LogMessage(L"YouTube: playlist cache hit %s", url.c_str());
+		return true;
+	}
+
 	m_scrapeUrl = url;
 	m_scrapePending = true;
 	SetStatusLocked(L"Scraping playlist...");
@@ -299,6 +475,20 @@ bool YouTubeManager::ScrapeHome()
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
 	if (m_scrapePending || m_homePending || !m_thread.joinable()) return false;
+
+	std::vector<YtTrack> cachedTracks;
+	if (FindScrapeCacheLocked(L"home", true, cachedTracks))
+	{
+		m_scrapeResultReady = true;
+		m_browseTracks = std::move(cachedTracks);
+		m_scrapeError.clear();
+		wchar_t buf[64];
+		wsprintfW(buf, L"Cached: %d tracks", (int)m_browseTracks.size());
+		SetStatusLocked(buf);
+		LogMessage(L"YouTube: home cache hit");
+		return true;
+	}
+
 	m_homePending = true;
 	SetStatusLocked(L"Scraping YT Music home...");
 	m_cv.notify_all();
@@ -596,6 +786,7 @@ void YouTubeManager::ThreadMain()
 			m_scrapeError = err;
 			if (!m_browseTracks.empty())
 			{
+				AddScrapeCacheLocked(L"home", true, m_browseTracks);
 				wchar_t buf[64];
 				wsprintfW(buf, L"Ready: %d tracks", (int)m_browseTracks.size());
 				SetStatusLocked(buf);
@@ -672,6 +863,7 @@ void YouTubeManager::ThreadMain()
 			m_scrapeError = err;
 			if (!m_browseTracks.empty())
 			{
+				AddScrapeCacheLocked(url, false, m_browseTracks);
 				wchar_t buf[64];
 				wsprintfW(buf, L"Ready: %d tracks", (int)m_browseTracks.size());
 				SetStatusLocked(buf);
@@ -764,6 +956,7 @@ void YouTubeManager::ThreadMain()
 		}
 
 		lock.lock();
+		res.url = url;
 		m_busy = false;
 		if (res.ok)
 		{
@@ -772,6 +965,21 @@ void YouTubeManager::ThreadMain()
 			SetStatusLocked(L"Ready: ");
 			m_status += res.title;
 			LogMessage(L"YouTube: download OK %s", res.filePath.c_str());
+
+			// content cache: remember url -> file so a later play is instant
+			bool found = false;
+			for (CacheEntry& e : m_cache)
+			{
+				if (e.url == url)
+				{
+					e.filePath = res.filePath;
+					found = true;
+					break;
+				}
+			}
+			if (!found)
+				m_cache.push_back({ url, res.filePath });
+			SaveCacheListLocked();
 		}
 		else
 		{
@@ -780,5 +988,16 @@ void YouTubeManager::ThreadMain()
 			LogMessage(L"YouTube: result FAILED url=%s", url.c_str());
 		}
 		m_results.push_back(res);
+
+		// Process the next queued download without waiting
+		if (!m_dlQueue.empty())
+		{
+			m_pendingUrl = m_dlQueue.front();
+			m_dlQueue.erase(m_dlQueue.begin());
+			m_busy = true;
+			wchar_t buf[64];
+			wsprintfW(buf, L"Downloading... (%d more queued)", (int)m_dlQueue.size());
+			SetStatusLocked(buf);
+		}
 	}
 }

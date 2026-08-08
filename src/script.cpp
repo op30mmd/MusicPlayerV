@@ -29,10 +29,12 @@ enum MenuAction
 	MENU_VOL_DOWN,
 	MENU_VOL_UP,
 	MENU_SHUFFLE,
+	MENU_REPEAT,
 	MENU_RELOAD,
 	MENU_PLAYURL,
 	MENU_BROWSE,
 	MENU_HOME,
+	MENU_CLEARQUEUE,
 	MENU_HIDE,
 	MENU_COUNT
 };
@@ -43,6 +45,29 @@ static int g_menuMode = MENU_MODE_MAIN;
 static std::vector<YtTrack> g_browseTracks;
 static int g_browseIndex = 0;
 static int g_browseOffset = 0;
+
+// Playback queue for YouTube tracks: enqueue from browse mode (E key),
+// downloads are chained by the manager and each completed track plays
+// when the current one ends.
+struct QueuedTrack
+{
+	std::wstring url;
+	std::wstring title;
+	std::wstring filePath;
+};
+static std::vector<QueuedTrack> g_ytQueue;
+static std::vector<QueuedTrack> g_ytQueueTemplate;
+static QueuedTrack g_queueAdvancing;
+static std::vector<std::wstring> g_abandonedUrls;
+static int g_resumeIndex = -1;
+static size_t g_resumePos = 0;
+static bool g_resumeActive = false;
+static bool g_resumePending = false;
+
+static void PlayQueueHead();
+static void EnqueueYoutubeTrack(const YtTrack& tr);
+static void NextTrack(bool trackEnded = false);
+static void ClearYoutubeQueue();
 
 static std::wstring TrimUrl(const std::wstring& in)
 {
@@ -107,6 +132,130 @@ void StartYouTubeFromClipboard()
 	UI::DrawNotification(L"MusicPlayer: Downloading YouTube audio...");
 }
 
+static void SetCurrentTrackName(const std::wstring& filePath)
+{
+	g_currentTrackName = filePath;
+	size_t pos = g_currentTrackName.find_last_of(L"\\/");
+	if (pos != std::wstring::npos)
+		g_currentTrackName = g_currentTrackName.substr(pos + 1);
+}
+
+// Start the next fully-downloaded track through the background decode thread
+// so the game never freezes. The swap is applied when the decode finishes and
+// is confirmed in PollQueueAdvance.
+static void PlayQueueHead()
+{
+	if (!g_queueAdvancing.url.empty() || g_resumePending) return;
+	for (size_t i = 0; i < g_ytQueue.size(); i++)
+	{
+		if (g_ytQueue[i].filePath.empty()) continue;
+		QueuedTrack played = g_ytQueue[i];
+		g_ytQueue.erase(g_ytQueue.begin() + i);
+
+		// Remember where the main queue was, so it can resume after the queue
+		if (!g_resumeActive && g_audioEngine.GetCurrentIndex() >= 0 &&
+			!g_audioEngine.GetCurrentTrackName().empty() && !g_audioEngine.HasEnded())
+		{
+			g_resumeIndex = g_audioEngine.GetCurrentIndex();
+			g_resumePos = g_audioEngine.GetPlaybackPos();
+			g_resumeActive = true;
+		}
+
+		g_audioEngine.LoadFileAsync(played.filePath);
+		g_queueAdvancing = played;
+		LogMessage(L"Queue: loading %s (%d left)", played.title.c_str(), (int)g_ytQueue.size());
+		return;
+	}
+}
+
+static void PollQueueAdvance()
+{
+	if (!g_queueAdvancing.url.empty())
+	{
+		if (g_audioEngine.HasExternalTrackPending()) return;
+		QueuedTrack adv = std::move(g_queueAdvancing);
+		g_queueAdvancing = {};
+		if (g_audioEngine.GetCurrentTrackName() == adv.filePath)
+		{
+			SetCurrentTrackName(adv.filePath);
+			LogMessage(L"Queue: playing %s (%d left)", g_currentTrackName.c_str(), (int)g_ytQueue.size());
+			UI::DrawNotification(L"MusicPlayer: Playing queued track");
+		}
+		else
+		{
+			LogMessage(L"Queue: could not load %s, skipping", adv.filePath.c_str());
+			PlayQueueHead();
+		}
+		return;
+	}
+
+	if (g_resumePending)
+	{
+		if (g_audioEngine.HasExternalTrackPending()) return;
+		g_resumePending = false;
+		SetCurrentTrackName(g_audioEngine.GetCurrentTrackName());
+		LogMessage(L"Resume: back to main queue: %s", g_currentTrackName.c_str());
+		UI::DrawNotification(L"MusicPlayer: Back to the main queue");
+	}
+}
+
+// Drop the remaining YouTube queue and go back to the main queue. Downloads
+// that are still running are marked abandoned: they finish quietly and are
+// added to the library without interrupting playback.
+static void ClearYoutubeQueue()
+{
+	bool hadAnything = !g_ytQueue.empty() || !g_queueAdvancing.url.empty();
+	if (!hadAnything)
+	{
+		UI::DrawNotification(L"MusicPlayer: YouTube queue is empty");
+		return;
+	}
+
+	if (!g_queueAdvancing.url.empty())
+	{
+		g_abandonedUrls.push_back(g_queueAdvancing.url);
+		g_queueAdvancing = {};
+		g_audioEngine.CancelExternalLoad();
+	}
+	for (size_t i = 0; i < g_ytQueue.size(); i++)
+		if (g_ytQueue[i].filePath.empty()) g_abandonedUrls.push_back(g_ytQueue[i].url);
+	g_ytQueue.clear();
+	g_ytQueueTemplate.clear();
+	LogMessage(L"Queue: cleared by user");
+	UI::DrawNotification(L"MusicPlayer: YouTube queue cleared");
+
+	if (g_trackList.empty())
+	{
+		g_resumeActive = false;
+		g_resumePending = false;
+		return;
+	}
+	NextTrack();
+}
+
+static void EnqueueYoutubeTrack(const YtTrack& tr)
+{
+	if (tr.type == 1)
+	{
+		UI::DrawNotification(L"MusicPlayer: Open the mix first, then queue its tracks");
+		return;
+	}
+	g_ytQueue.push_back({ tr.url, tr.title, L"" });
+	g_ytQueueTemplate.push_back({ tr.url, tr.title, L"" });
+	if (!g_youtube.StartDownload(tr.url))
+	{
+		g_ytQueue.pop_back();
+		g_ytQueueTemplate.pop_back();
+		UI::DrawNotification(L"MusicPlayer: Could not queue (yt-dlp missing?)");
+		return;
+	}
+	LogMessage(L"Queue: added %s (%d in queue)", tr.title.c_str(), (int)g_ytQueue.size());
+	wchar_t msg[128];
+	wsprintfW(msg, L"MusicPlayer: Queued: %s", tr.title.c_str());
+	if (wcslen(msg) > 100) msg[100] = L'\0';
+	UI::DrawNotification(msg);
+}
+
 void PollYouTubeDownloads()
 {
 	YtDownload dl;
@@ -114,10 +263,61 @@ void PollYouTubeDownloads()
 	{
 		if (!dl.ok)
 		{
-			std::wstring msg = L"MusicPlayer: YouTube download failed: " + dl.error;
-			if (msg.size() > 120) msg = msg.substr(0, 120);
-			UI::DrawNotification(msg.c_str());
-			LogMessage(L"YouTube: failed notification: %s", msg.c_str());
+			bool wasQueue = false;
+			for (auto it = g_ytQueue.begin(); it != g_ytQueue.end(); ++it)
+			{
+				if (it->url == dl.url)
+				{
+					LogMessage(L"Queue: download failed, removed %s error=%s", it->title.c_str(), dl.error.c_str());
+					g_ytQueue.erase(it);
+					wasQueue = true;
+					break;
+				}
+			}
+			if (wasQueue)
+			{
+				auto t = std::find_if(g_ytQueueTemplate.begin(), g_ytQueueTemplate.end(),
+					[&](const QueuedTrack& q) { return q.url == dl.url; });
+				if (t != g_ytQueueTemplate.end())
+					g_ytQueueTemplate.erase(t);
+			}
+			else
+			{
+				std::wstring msg = L"MusicPlayer: YouTube download failed: " + dl.error;
+				if (msg.size() > 120) msg = msg.substr(0, 120);
+				UI::DrawNotification(msg.c_str());
+				LogMessage(L"YouTube: failed notification: %s", msg.c_str());
+			}
+			continue;
+		}
+
+		// Does this completed download belong to the playback queue?
+		auto it = std::find_if(g_ytQueue.begin(), g_ytQueue.end(),
+			[&](const QueuedTrack& q) { return q.url == dl.url && q.filePath.empty(); });
+		if (it != g_ytQueue.end())
+		{
+			it->filePath = dl.filePath;
+			auto t = std::find_if(g_ytQueueTemplate.begin(), g_ytQueueTemplate.end(),
+				[&](const QueuedTrack& q) { return q.url == dl.url; });
+			if (t != g_ytQueueTemplate.end())
+				t->filePath = dl.filePath;
+			LogMessage(L"Queue: downloaded %s (%d waiting)", dl.filePath.c_str(), (int)g_ytQueue.size());
+			UI::DrawNotification(L"MusicPlayer: Queued track ready");
+			if (!g_audioEngine.IsPlaying())
+				PlayQueueHead();
+			continue;
+		}
+
+		// Was this download abandoned when the user exited the queue?
+		auto ab = std::find(g_abandonedUrls.begin(), g_abandonedUrls.end(), dl.url);
+		if (ab != g_abandonedUrls.end())
+		{
+			g_abandonedUrls.erase(ab);
+			int keepIndex = g_audioEngine.GetCurrentIndex();
+			g_trackList.push_back(dl.filePath);
+			g_audioEngine.SetPlayQueue(g_trackList.data(), (int)g_trackList.size());
+			g_audioEngine.SetCurrentIndex(keepIndex);
+			LogMessage(L"Queue: abandoned download finished, added to library %s", dl.filePath.c_str());
 			continue;
 		}
 
@@ -126,10 +326,7 @@ void PollYouTubeDownloads()
 		g_audioEngine.SetCurrentIndex((int)g_trackList.size() - 1);
 		g_audioEngine.PlayQueue();
 
-		g_currentTrackName = dl.filePath;
-		size_t pos = g_currentTrackName.find_last_of(L"\\/");
-		if (pos != std::wstring::npos)
-			g_currentTrackName = g_currentTrackName.substr(pos + 1);
+		SetCurrentTrackName(dl.filePath);
 		LogMessage(L"YouTube: added to library and playing %s", dl.filePath.c_str());
 		UI::DrawNotification(L"MusicPlayer: Now playing downloaded track");
 	}
@@ -266,9 +463,45 @@ void ShutdownMusicPlayer()
 	g_audioEngine.Shutdown();
 }
 
-void NextTrack()
+void NextTrack(bool trackEnded)
 {
-	if (g_trackList.empty()) return;
+	// A queued YouTube track is ready: advance into the queue (also the way
+	// out of a Repeat One loop)
+	bool anyReady = std::any_of(g_ytQueue.begin(), g_ytQueue.end(),
+		[](const QueuedTrack& q) { return !q.filePath.empty(); });
+	if (anyReady)
+	{
+		PlayQueueHead();
+		return;
+	}
+
+	// Repeat All: when the YouTube queue has been fully played out (nothing
+	// ready and nothing downloading), loop it from the start. Only when the
+	// previous track ended on its own - a manual Next press must be able to
+	// leave the queue instead of looping the same tracks forever.
+	if (trackEnded && g_modConfig.repeat == 1 && g_queueAdvancing.url.empty() &&
+		g_ytQueue.empty() && !g_ytQueueTemplate.empty())
+	{
+		LogMessage(L"NextTrack: repeat all, queueing %d queued tracks", (int)g_ytQueueTemplate.size());
+		for (size_t i = 0; i < g_ytQueueTemplate.size(); i++)
+			if (!g_ytQueueTemplate[i].filePath.empty())
+				g_ytQueue.push_back(g_ytQueueTemplate[i]);
+		PlayQueueHead();
+		return;
+	}
+
+	// The YouTube queue took over mid-track: resume the main queue where it
+	// was interrupted instead of skipping the track
+	if (g_resumeActive && g_resumeIndex >= 0 && g_resumeIndex < (int)g_trackList.size())
+	{
+		g_resumeActive = false;
+		g_audioEngine.SetCurrentIndex(g_resumeIndex);
+		g_audioEngine.LoadFileAsync(g_trackList[g_resumeIndex], g_resumePos);
+		g_resumePending = true;
+		LogMessage(L"NextTrack: resuming main queue at index %d", g_resumeIndex);
+		return;
+	}
+
 	g_audioEngine.NextTrack();
 	g_currentTrackName = g_audioEngine.GetCurrentTrackName();
 	size_t pos = g_currentTrackName.find_last_of(L"\\/");
@@ -346,6 +579,13 @@ void ActivateMenuAction(int action)
 		LogMessage(L"Menu: shuffle=%d", g_modConfig.shuffle);
 		UI::DrawNotification(g_modConfig.shuffle ? L"MusicPlayer: Shuffle ON (applies on reload)" : L"MusicPlayer: Shuffle OFF");
 		break;
+	case MENU_REPEAT:
+		g_modConfig.repeat = (g_modConfig.repeat + 1) % 3;
+		LogMessage(L"Menu: repeat=%d", g_modConfig.repeat);
+		if (g_modConfig.repeat == 0) UI::DrawNotification(L"MusicPlayer: Repeat OFF");
+		else if (g_modConfig.repeat == 1) UI::DrawNotification(L"MusicPlayer: Repeat ALL");
+		else UI::DrawNotification(L"MusicPlayer: Repeat ONE");
+		break;
 	case MENU_RELOAD: ReloadLibrary(); break;
 	case MENU_PLAYURL: StartYouTubeFromClipboard(); break;
 	case MENU_BROWSE:
@@ -376,6 +616,9 @@ void ActivateMenuAction(int action)
 		UI::DrawNotification(L"MusicPlayer: Scraping YT Music home...");
 		break;
 	}
+	case MENU_CLEARQUEUE:
+		ClearYoutubeQueue();
+		break;
 	case MENU_HIDE:
 		g_showUI = false;
 		g_modConfig.showUI = g_showUI;
@@ -489,6 +732,11 @@ void ProcessControls()
 						UI::DrawNotification(L"MusicPlayer: Downloading selected track...");
 				}
 			}
+
+			if (IsKeyJustUp(0x45) && g_browseIndex < total) // E key
+			{
+				EnqueueYoutubeTrack(g_browseTracks[g_browseIndex]);
+			}
 		}
 		else
 		{
@@ -524,8 +772,19 @@ void ProcessControls()
 
 	if (g_audioEngine.HasEnded() && !g_audioEngine.HasPendingTrackChange())
 	{
+		// Repeat One: restart the current track (library or queued YouTube)
+		// before considering the queue, otherwise a looping track would never
+		// get the chance to repeat
+		if (g_modConfig.repeat == 2)
+		{
+			LogMessage(L"AutoAdvance: track ended, repeat one");
+			g_audioEngine.Play();
+			g_audioEngine.PreloadNextTrack();
+			return;
+		}
+
 		LogMessage(L"AutoAdvance: track ended");
-		NextTrack();
+		NextTrack(true);
 	}
 }
 
@@ -565,11 +824,13 @@ void DrawUI()
 	const float lineHeight = 0.028f;
 
 	std::wstring ytStatus = g_youtube.GetStatusText();
+	bool queueVisible = !g_ytQueue.empty();
 
-	// Dynamic height: top pad + 3 info lines + optional yt line + items + hint + bottom pad
+	// Dynamic height: top pad + 3 info lines + optional yt line + optional queue line + items + hint + bottom pad
 	float bgHeight = lineHeight * 0.72f
 		+ lineHeight * (1.15f + 1.15f + 1.2f)
 		+ (ytStatus.empty() ? 0.0f : lineHeight * 1.2f)
+		+ (queueVisible ? lineHeight * 1.2f : 0.0f)
 		+ lineHeight * (float)MENU_COUNT
 		+ lineHeight * 1.3f
 		+ lineHeight * 0.3f;
@@ -600,6 +861,18 @@ void DrawUI()
 		lineTop += lineHeight * 1.2f;
 	}
 
+	if (queueVisible)
+	{
+		wchar_t queueText[80];
+		int waiting = 0;
+		for (size_t i = 0; i < g_ytQueue.size(); i++)
+			if (g_ytQueue[i].filePath.empty()) waiting++;
+		int ready = (int)g_ytQueue.size() - waiting;
+		wsprintfW(queueText, L"YouTube queue: %d in line (%d ready)", (int)g_ytQueue.size(), ready);
+		UI::DrawText(menuLeft + 0.01f, lineTop + 0.004f, queueText, 0.22f, 255, 255, 0);
+		lineTop += lineHeight * 1.2f;
+	}
+
 	wchar_t itemText[64];
 	for (int i = 0; i < MENU_COUNT; i++)
 	{
@@ -624,6 +897,10 @@ void DrawUI()
 		case MENU_SHUFFLE:
 			wsprintfW(itemText, L"Shuffle: %s", g_modConfig.shuffle ? L"On" : L"Off");
 			break;
+		case MENU_REPEAT:
+			wsprintfW(itemText, L"Repeat: %s",
+				g_modConfig.repeat == 0 ? L"Off" : (g_modConfig.repeat == 1 ? L"All" : L"One"));
+			break;
 		case MENU_RELOAD:
 			wsprintfW(itemText, L"Reload Library");
 			break;
@@ -635,6 +912,10 @@ void DrawUI()
 			break;
 		case MENU_HOME:
 			wsprintfW(itemText, L"Browse YT Music Home");
+			break;
+		case MENU_CLEARQUEUE:
+			wsprintfW(itemText, L"Clear YouTube queue (%d)",
+				(int)g_ytQueue.size() + (g_queueAdvancing.url.empty() ? 0 : 1));
 			break;
 		case MENU_HIDE:
 			wsprintfW(itemText, L"Hide UI (F8)");
@@ -710,7 +991,7 @@ void DrawBrowseUI()
 	DrawMenuLine(menuLeft, lineTop, lineHeight, L"<- Back to menu", backActive, 255, 255, 255);
 	lineTop += lineHeight * 1.3f;
 
-	UI::DrawText(menuLeft + 0.01f, lineTop + 0.004f, L"Enter: play | [Mix]: open list | Backspace: back | L/R: volume", 0.2f, 150, 150, 150);
+	UI::DrawText(menuLeft + 0.01f, lineTop + 0.004f, L"Enter: play | E: add to queue | [Mix]: open list | Backspace: back | L/R: volume", 0.2f, 150, 150, 150);
 }
 
 void DisableGameControlsForMenu()
@@ -792,6 +1073,7 @@ void ProcessMusicPlayer()
 
 	g_audioEngine.Update();
 	PollYouTubeDownloads();
+	PollQueueAdvance();
 	PollScrapeResult();
 	DrawUI();
 }

@@ -16,10 +16,13 @@ bool LoadConfig(ModConfig* config, const wchar_t* iniPath)
 	GetPrivateProfileStringW(L"MusicPlayer", L"MusicDirectory", L"", config->musicDirectory, MAX_PATH, iniPath);
 	config->volume = GetPrivateProfileIntW(L"MusicPlayer", L"Volume", 50, iniPath);
 	config->shuffle = GetPrivateProfileIntW(L"MusicPlayer", L"Shuffle", 0, iniPath) != 0;
+	config->repeat = GetPrivateProfileIntW(L"MusicPlayer", L"Repeat", 1, iniPath);
 	config->showUI = GetPrivateProfileIntW(L"MusicPlayer", L"ShowUI", 1, iniPath) != 0;
 
 	if (config->volume < 0) config->volume = 0;
 	if (config->volume > 100) config->volume = 100;
+	if (config->repeat < 0) config->repeat = 0;
+	if (config->repeat > 2) config->repeat = 2;
 
 	return true;
 }
@@ -33,6 +36,8 @@ bool SaveConfig(const ModConfig* config, const wchar_t* iniPath)
 	wsprintfW(buf, L"%d", config->volume);
 	WritePrivateProfileStringW(L"MusicPlayer", L"Volume", buf, iniPath);
 	WritePrivateProfileStringW(L"MusicPlayer", L"Shuffle", config->shuffle ? L"1" : L"0", iniPath);
+	wsprintfW(buf, L"%d", config->repeat);
+	WritePrivateProfileStringW(L"MusicPlayer", L"Repeat", buf, iniPath);
 	WritePrivateProfileStringW(L"MusicPlayer", L"ShowUI", config->showUI ? L"1" : L"0", iniPath);
 
 	return true;

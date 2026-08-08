@@ -281,7 +281,8 @@ AudioEngine::AudioEngine()
 	m_waveFormat(nullptr),
 	m_playbackPos(0), m_streamEnded(false),
 	m_currentIndex(-1), m_volume(0.5f), m_isPlaying(false), m_isPaused(false),
-	m_shutdown(false), m_decodeState(DECODE_IDLE), m_swapRequested(false), m_failCount(0)
+	m_shutdown(false), m_decodeState(DECODE_IDLE), m_swapRequested(false), m_failCount(0),
+	m_externalPending(false), m_externalResumePos(0)
 {
 }
 
@@ -366,6 +367,52 @@ bool AudioEngine::LoadFile(const std::wstring& filePath)
 	return true;
 }
 
+void AudioEngine::LoadFileAsync(const std::wstring& filePath, size_t resumePos)
+{
+	std::lock_guard<std::mutex> lock(m_decodeMutex);
+	m_externalPath = filePath;
+	m_externalResumePos = resumePos;
+	m_externalPending = true;
+	m_failCount = 0;
+	if (m_decodeState == DECODE_READY && m_readyPath == filePath)
+	{
+		// A preloaded buffer is already cached: swap to it without decoding
+		m_swapRequested = true;
+	}
+	else
+	{
+		StartLoadLocked(filePath, true);
+	}
+}
+
+bool AudioEngine::HasExternalTrackPending()
+{
+	std::lock_guard<std::mutex> lock(m_decodeMutex);
+	return m_externalPending;
+}
+
+void AudioEngine::CancelExternalLoad()
+{
+	std::lock_guard<std::mutex> lock(m_decodeMutex);
+	if (m_externalPending)
+	{
+		m_externalPending = false;
+		m_swapRequested = false;
+	}
+}
+
+void AudioEngine::PreloadPath(const std::wstring& path)
+{
+	std::lock_guard<std::mutex> lock(m_decodeMutex);
+	StartLoadLocked(path, false);
+}
+
+bool AudioEngine::IsReadyPath(const std::wstring& path)
+{
+	std::lock_guard<std::mutex> lock(m_decodeMutex);
+	return m_decodeState == DECODE_READY && m_readyPath == path;
+}
+
 void AudioEngine::ApplyDecodedBuffer(std::vector<BYTE>&& pcm, const WAVEFORMATEX& wfx)
 {
 	if (m_sourceVoice)
@@ -397,6 +444,11 @@ void AudioEngine::ApplyDecodedBuffer(std::vector<BYTE>&& pcm, const WAVEFORMATEX
 	{
 		LogMessage(L"ApplyDecodedBuffer: CreateSourceVoice failed hr=0x%08X", hr);
 		m_sourceVoice = nullptr;
+	}
+	else
+	{
+		// a new voice always starts at full volume; keep the user's setting
+		m_sourceVoice->SetVolume(m_volume);
 	}
 }
 
@@ -649,11 +701,32 @@ void AudioEngine::ProcessAsyncDecode()
 		m_decodeState = DECODE_IDLE;
 		m_failCount = 0;
 		bool resumePlayback = !m_isPaused;
+		bool isExternal = m_externalPending && path == m_externalPath;
+		if (isExternal) m_externalPending = false;
 		lock.unlock();
 
 		LogMessage(L"Audio: applying decoded track %s", path.c_str());
 		ApplyDecodedBuffer(std::move(pcm), wfx);
 		m_currentTrackName = path;
+
+		if (isExternal)
+		{
+			size_t pos = m_externalResumePos;
+			m_externalResumePos = 0;
+			if (m_sourceVoice && pos > 0 && pos < m_pcmData.size())
+			{
+				m_playbackPos = pos;
+				size_t chunk = min((size_t)CHUNK_BYTES, m_pcmData.size() - m_playbackPos);
+				XAUDIO2_BUFFER buf = {};
+				buf.AudioBytes = (UINT32)chunk;
+				buf.pAudioData = m_pcmData.data() + m_playbackPos;
+				m_sourceVoice->SubmitSourceBuffer(&buf);
+				m_playbackPos += chunk;
+			}
+			if (resumePlayback) Play();
+			return;
+		}
+
 		if (resumePlayback) Play();
 		PreloadNextTrack();
 		return;
@@ -661,6 +734,20 @@ void AudioEngine::ProcessAsyncDecode()
 
 	if (m_decodeState == DECODE_FAILED && m_swapRequested)
 	{
+		if (m_externalPending)
+		{
+			// A queue/resume load failed: keep whatever is playing and let
+			// the script skip to the next entry. Never touch the library
+			// queue for external loads.
+			m_externalPending = false;
+			m_swapRequested = false;
+			m_decodeState = DECODE_IDLE;
+			m_failCount = 0;
+			lock.unlock();
+			LogMessage(L"Audio: external track load failed, keeping current track");
+			return;
+		}
+
 		if (m_isPaused)
 		{
 			lock.unlock();

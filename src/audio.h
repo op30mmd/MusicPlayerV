@@ -55,6 +55,19 @@ public:
 	bool IsPlaying() const { return m_isPlaying; }
 	bool HasEnded() const { return m_streamEnded && !m_isPlaying; }
 	bool HasPendingTrackChange();
+	size_t GetPlaybackPos() const { return m_playbackPos; }
+
+	// Load a track outside the library queue through the background decode
+	// thread (no main-thread freeze). If resumePos is set, playback starts
+	// from that byte offset into the decoded PCM. Success/failure is detected
+	// via GetCurrentTrackName() once HasExternalTrackPending() clears.
+	void LoadFileAsync(const std::wstring& filePath, size_t resumePos = 0);
+	bool HasExternalTrackPending();
+	void CancelExternalLoad();
+	// Decode into the ready buffer without swapping (used to cache the next
+	// queued track ahead of time); LoadFileAsync then reuses that buffer.
+	void PreloadPath(const std::wstring& path);
+	bool IsReadyPath(const std::wstring& path);
 
 private:
 	void ApplyDecodedBuffer(std::vector<BYTE>&& pcm, const WAVEFORMATEX& wfx);
@@ -92,6 +105,10 @@ private:
 	std::vector<BYTE> m_readyPcm;
 	WAVEFORMATEX m_readyWfx;
 	std::wstring m_readyPath;
+
+	bool m_externalPending;
+	std::wstring m_externalPath;
+	size_t m_externalResumePos;
 
 	static const UINT32 MAX_BUFFER_COUNT = 4;
 	static const UINT32 CHUNK_BYTES = 65536;

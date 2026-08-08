@@ -12,6 +12,7 @@ struct YtDownload
 	bool ok = false;
 	std::wstring filePath;
 	std::wstring title;
+	std::wstring url;
 	std::wstring error;
 };
 
@@ -26,6 +27,12 @@ struct YtTrack
 class YouTubeManager
 {
 public:
+	struct CacheEntry
+	{
+		std::wstring url;
+		std::wstring filePath;
+	};
+
 	YouTubeManager();
 	~YouTubeManager();
 
@@ -49,6 +56,10 @@ private:
 	bool FindYtDlpExe(const std::wstring& exeDir);
 	bool RunProcess(const std::wstring& cmdLine, const std::wstring& workDir, std::string& stdoutText, DWORD& exitCode);
 	void SetStatusLocked(const wchar_t* text);
+	void LoadCacheFile();
+	void SaveCacheListLocked();
+	bool FindScrapeCacheLocked(const std::wstring& key, bool isHome, std::vector<YtTrack>& out);
+	void AddScrapeCacheLocked(const std::wstring& key, bool isHome, std::vector<YtTrack> tracks);
 
 	std::wstring m_exeDir;
 	std::wstring m_downloadDir;
@@ -67,6 +78,7 @@ private:
 	bool m_shutdown = false;
 	bool m_busy = false;
 	std::wstring m_pendingUrl;
+	std::vector<std::wstring> m_dlQueue;
 	std::wstring m_status;
 	std::vector<YtDownload> m_results;
 
@@ -78,4 +90,15 @@ private:
 	std::wstring m_scrapeError;
 	std::wstring m_nodePath;
 	std::wstring m_homeScriptPath;
+	std::wstring m_cachePath;
+	std::vector<CacheEntry> m_cache;
+
+	struct ScrapeCacheEntry
+	{
+		std::wstring key;
+		bool isHome = false;
+		ULONGLONG storedTick = 0;
+		std::vector<YtTrack> tracks;
+	};
+	std::vector<ScrapeCacheEntry> m_scrapeCache;
 };
