@@ -130,24 +130,6 @@ bool YouTubeManager::Initialize(const std::wstring& exeDir, const std::wstring& 
 	if (!m_downloadDir.empty())
 		CreateDirectoryW(m_downloadDir.c_str(), nullptr);
 
-	wchar_t iniPath[MAX_PATH];
-	wsprintfW(iniPath, L"%sMusicPlayer.ini", exeDir.c_str());
-	wchar_t browser[64] = { 0 };
-	GetPrivateProfileStringW(L"MusicPlayer", L"YtDlpBrowser", L"", browser, 64, iniPath);
-	if (browser[0]) m_browserName = browser;
-
-	wchar_t jsRuntime[64] = { 0 };
-	GetPrivateProfileStringW(L"MusicPlayer", L"YtDlpJsRuntime", L"", jsRuntime, 64, iniPath);
-	if (jsRuntime[0]) m_jsRuntime = jsRuntime;
-
-	wchar_t extraArgs[1024] = { 0 };
-	GetPrivateProfileStringW(L"MusicPlayer", L"YtDlpArgs", L"", extraArgs, 1024, iniPath);
-	if (extraArgs[0]) m_extraArgs = extraArgs;
-
-	m_bitrate = GetPrivateProfileIntW(L"MusicPlayer", L"YtDlpBitrate", 192, iniPath);
-	m_maxSizeMb = GetPrivateProfileIntW(L"MusicPlayer", L"YtDlpMaxSize", 100, iniPath);
-	m_timeoutSec = GetPrivateProfileIntW(L"MusicPlayer", L"YtDlpTimeout", 1800, iniPath);
-
 	if (GetFileAttributesW((exeDir + L"cookies.txt").c_str()) != INVALID_FILE_ATTRIBUTES)
 		m_cookiesPath = exeDir + L"cookies.txt";
 
@@ -157,6 +139,7 @@ bool YouTubeManager::Initialize(const std::wstring& exeDir, const std::wstring& 
 		return false;
 	}
 
+	RefreshSettings();
 	LogMessage(L"YouTube: yt-dlp at %s", m_ytdlpPath.c_str());
 	if (!m_cookiesPath.empty()) LogMessage(L"YouTube: using cookies file %s", m_cookiesPath.c_str());
 	if (!m_browserName.empty()) LogMessage(L"YouTube: using live browser cookies (%s) - no export needed, refresh handled automatically", m_browserName.c_str());
@@ -166,6 +149,28 @@ bool YouTubeManager::Initialize(const std::wstring& exeDir, const std::wstring& 
 	m_shutdown = false;
 	m_thread = std::thread(&YouTubeManager::ThreadMain, this);
 	return true;
+}
+
+void YouTubeManager::RefreshSettings()
+{
+	wchar_t iniPath[MAX_PATH];
+	wsprintfW(iniPath, L"%sMusicPlayer.ini", m_exeDir.c_str());
+
+	wchar_t browser[64] = { 0 };
+	GetPrivateProfileStringW(L"MusicPlayer", L"YtDlpBrowser", L"", browser, 64, iniPath);
+	m_browserName = browser[0] ? browser : std::wstring();
+
+	wchar_t jsRuntime[64] = { 0 };
+	GetPrivateProfileStringW(L"MusicPlayer", L"YtDlpJsRuntime", L"", jsRuntime, 64, iniPath);
+	m_jsRuntime = jsRuntime[0] ? jsRuntime : std::wstring();
+
+	wchar_t extraArgs[1024] = { 0 };
+	GetPrivateProfileStringW(L"MusicPlayer", L"YtDlpArgs", L"", extraArgs, 1024, iniPath);
+	m_extraArgs = extraArgs[0] ? extraArgs : std::wstring();
+
+	m_bitrate = GetPrivateProfileIntW(L"MusicPlayer", L"YtDlpBitrate", 192, iniPath);
+	m_maxSizeMb = GetPrivateProfileIntW(L"MusicPlayer", L"YtDlpMaxSize", 100, iniPath);
+	m_timeoutSec = GetPrivateProfileIntW(L"MusicPlayer", L"YtDlpTimeout", 1800, iniPath);
 }
 
 void YouTubeManager::Shutdown()
@@ -366,6 +371,7 @@ void YouTubeManager::ThreadMain()
 		lock.unlock();
 
 		LogMessage(L"YouTube: downloading %s", url.c_str());
+		RefreshSettings();
 
 		std::wstring cookiesPath;
 		if (m_cookiesPath.empty() &&
@@ -410,10 +416,16 @@ void YouTubeManager::ThreadMain()
 			wsprintfW(buf, L"--max-filesize %dM ", m_maxSizeMb);
 			cmd += buf;
 		}
-		if (!cookiesPath.empty())
-			cmd += L"--cookies \"" + cookiesPath + L"\" ";
-		else if (!m_browserName.empty())
+		if (!m_browserName.empty())
+		{
 			cmd += L"--cookies-from-browser " + m_browserName + L" ";
+			LogMessage(L"YouTube: using live browser cookies (%s)", m_browserName.c_str());
+		}
+		else if (!cookiesPath.empty())
+		{
+			cmd += L"--cookies \"" + cookiesPath + L"\" ";
+			LogMessage(L"YouTube: using cookies file %s", cookiesPath.c_str());
+		}
 		cmd += L"-o \"" + outDir + L"\\%(title)s.%(ext)s\" \"" + url + L"\"";
 
 		std::string stdoutText;

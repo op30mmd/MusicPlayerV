@@ -34,6 +34,7 @@ public:
 
 private:
 	void ThreadMain();
+	void RefreshSettings();
 	bool FindYtDlpExe(const std::wstring& exeDir);
 	bool RunProcess(const std::wstring& cmdLine, const std::wstring& workDir, std::string& stdoutText, DWORD& exitCode);
 	void SetStatusLocked(const wchar_t* text);
