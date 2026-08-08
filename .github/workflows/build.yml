@@ -42,6 +42,16 @@ jobs:
           $expected = Join-Path $depsDir "ffmpeg-9.0-full_build-shared"
           if ($extracted.FullName -ne $expected) { Move-Item $extracted.FullName $expected }
 
+      - name: Download yt-dlp
+        shell: pwsh
+        run: |
+          $toolsDir = Join-Path $env:GITHUB_WORKSPACE "deps\yt-dlp"
+          New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" `
+            -OutFile (Join-Path $toolsDir "yt-dlp.exe")
+          & (Join-Path $toolsDir "yt-dlp.exe") --version
+          if ($LASTEXITCODE -ne 0) { throw "yt-dlp failed to run" }
+
       - name: Build (Release x64)
         shell: pwsh
         run: |
@@ -60,6 +70,8 @@ jobs:
           $staging = Join-Path $env:RUNNER_TEMP "staging"
           New-Item -ItemType Directory -Force -Path $staging | Out-Null
           Copy-Item "$buildDir\*" $staging -Exclude obj -Force
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE "deps\yt-dlp\yt-dlp.exe") $staging -Force
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE "ytmusic.mjs") $staging -Force
           Copy-Item (Join-Path $env:GITHUB_WORKSPACE "README.md") $staging -Force
           Copy-Item (Join-Path $env:GITHUB_WORKSPACE "LICENSE") $staging -Force
           $zip = Join-Path $env:GITHUB_WORKSPACE "MusicPlayer-$env:TAG_NAME.zip"
