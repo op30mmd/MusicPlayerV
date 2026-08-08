@@ -58,6 +58,16 @@ Notes:
 - No ffmpeg.exe is needed: the mod requests the best audio-only stream (`-f ba*`), which the bundled FFmpeg DLLs decode directly.
 - Downloaded files stay in the YouTube folder; press F5 to reload only local library files (the folder is not scanned automatically).
 
+## Browsing a YouTube Music playlist
+
+Put a playlist, album, or channel URL in `MusicPlayer.playlist` (next to the `.asi`), then select **"Browse YouTube Playlist"** in the menu. The mod scrapes up to 500 track titles via `yt-dlp --flat-playlist` (nothing is downloaded yet) and switches the menu into browse mode:
+
+- **Up / Down** — move through the track list (scrolls for long playlists)
+- **Enter** — download & play the selected track
+- **<- Back to menu** — return to the main menu
+
+The same cookie source as downloads is used, so private/liked playlists from your logged-in browser work.
+
 ## YouTube cookies (age-restricted / logged-in downloads)
 
 If YouTube asks for verification, or a download fails with "Sign in to confirm you're not a bot", give yt-dlp your browser session:

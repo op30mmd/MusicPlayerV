@@ -73,6 +73,44 @@ static std::wstring NewestAudioFile(const std::wstring& dir, const FILETIME& aft
 	return best;
 }
 
+static void ParseTrackLines(const std::string& text, std::vector<YtTrack>& out)
+{
+	size_t pos = 0;
+	while (pos < text.size())
+	{
+		size_t nl = text.find('\n', pos);
+		if (nl == std::string::npos) nl = text.size();
+		std::string line = text.substr(pos, nl - pos);
+		pos = nl + 1;
+		if (!line.empty() && line[line.size() - 1] == '\r') line.pop_back();
+		if (line.empty()) continue;
+		size_t t1 = line.find('\t');
+		if (t1 == std::string::npos) continue;
+		size_t t2 = line.find('\t', t1 + 1);
+		if (t2 == std::string::npos) continue;
+		size_t t3 = line.rfind('\t');
+		if (t3 == t2) t3 = std::string::npos; // 3-column yt-dlp output (no type)
+		YtTrack tr;
+		tr.id = Utf8ToWide(line.substr(0, t1));
+		tr.title = Utf8ToWide(line.substr(t1 + 1, t2 - t1 - 1));
+		for (wchar_t& c : tr.title)
+			if (c == L'\r' || c == L'\n' || c == L'\t') c = L' ';
+		std::wstring type;
+		if (t3 != std::string::npos)
+		{
+			tr.url = Utf8ToWide(line.substr(t2 + 1, t3 - t2 - 1));
+			type = Utf8ToWide(line.substr(t3 + 1));
+		}
+		else
+		{
+			tr.url = Utf8ToWide(line.substr(t2 + 1));
+		}
+		tr.type = (type == L"playlist") ? 1 : 0;
+		if (tr.id.empty() || tr.url.empty()) continue;
+		out.push_back(std::move(tr));
+	}
+}
+
 static std::string StripAnsi(const std::string& in)
 {
 	std::string out;
@@ -101,6 +139,26 @@ static std::wstring ExtractError(const std::string& text)
 	while (!line.empty() && (line[line.size() - 1] == ' ' || line[line.size() - 1] == '\t')) line.pop_back();
 	if (line.size() > 200) line = line.substr(0, 200);
 	return Utf8ToWide(line);
+}
+
+// A dumped cookie jar is only useful if it actually contains YouTube cookies;
+// yt-dlp can leave a header-only file behind when cookie extraction fails
+// (e.g. Firefox profile locked by a running browser). The full jar must be
+// scanned: jars sort cookies by domain and youtube.com entries can sit far
+// past the first 64 KB.
+static bool CookiesFileUsable(const std::wstring& path)
+{
+	HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (h == INVALID_HANDLE_VALUE) return false;
+	std::string content;
+	char buf[65536];
+	DWORD read = 0;
+	while (content.size() < 8 * 1024 * 1024 &&
+		ReadFile(h, buf, sizeof(buf), &read, nullptr) && read > 0)
+		content.append(buf, read);
+	CloseHandle(h);
+	return content.find("youtube.com") != std::string::npos;
 }
 
 static void CleanupPartialFiles(const std::wstring& dir, const FILETIME& afterTime)
@@ -226,6 +284,27 @@ bool YouTubeManager::StartDownload(const std::wstring& url)
 	return true;
 }
 
+bool YouTubeManager::ScrapePlaylist(const std::wstring& url)
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	if (m_scrapePending || m_homePending || !m_thread.joinable()) return false;
+	m_scrapeUrl = url;
+	m_scrapePending = true;
+	SetStatusLocked(L"Scraping playlist...");
+	m_cv.notify_all();
+	return true;
+}
+
+bool YouTubeManager::ScrapeHome()
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	if (m_scrapePending || m_homePending || !m_thread.joinable()) return false;
+	m_homePending = true;
+	SetStatusLocked(L"Scraping YT Music home...");
+	m_cv.notify_all();
+	return true;
+}
+
 bool YouTubeManager::IsBusy() const
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
@@ -249,6 +328,16 @@ bool YouTubeManager::PopResult(YtDownload& out)
 	if (m_results.empty()) return false;
 	out = m_results.front();
 	m_results.erase(m_results.begin());
+	return true;
+}
+
+bool YouTubeManager::PopScrapeResult(std::vector<YtTrack>& out, std::wstring& error)
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	if (!m_scrapeResultReady) return false;
+	m_scrapeResultReady = false;
+	out = std::move(m_browseTracks);
+	error = m_scrapeError;
 	return true;
 }
 
@@ -362,15 +451,19 @@ void YouTubeManager::ThreadMain()
 
 	while (true)
 	{
-		m_cv.wait(lock, [this] { return m_shutdown || m_busy; });
+		m_cv.wait(lock, [this] { return m_shutdown || m_busy || m_scrapePending || m_homePending; });
 		if (m_shutdown) return;
 
-		std::wstring url = m_pendingUrl;
-		m_pendingUrl.clear();
+		bool doScrape = m_scrapePending;
+		bool doHome = m_homePending;
+		if (doHome) m_homePending = false;
+		std::wstring url = doScrape ? m_scrapeUrl : m_pendingUrl;
+		if (doScrape) m_scrapePending = false; else m_pendingUrl.clear();
 		std::wstring outDir = m_downloadDir;
 		lock.unlock();
 
-		LogMessage(L"YouTube: downloading %s", url.c_str());
+		if (doHome) LogMessage(L"YouTube: scraping YT Music home");
+		else LogMessage(L"YouTube: %s %s", doScrape ? L"scraping" : L"downloading", url.c_str());
 		RefreshSettings();
 
 		std::wstring cookiesPath;
@@ -395,6 +488,201 @@ void YouTubeManager::ThreadMain()
 				cookiesPath = work;
 			else
 				LogMessage(L"YouTube: WARNING could not create cookies work copy, using master");
+		}
+
+		auto runNodeScrape = [&](const std::wstring& targetUrl, std::vector<YtTrack>& tracks, std::wstring& err) -> bool
+		{
+			if (m_nodePath.empty())
+			{
+				wchar_t pathBuf[MAX_PATH];
+				DWORD len = SearchPathW(nullptr, L"node.exe", nullptr, MAX_PATH, pathBuf, nullptr);
+				if (len > 0 && len < MAX_PATH) m_nodePath = pathBuf;
+				else { err = L"Node.js not found on PATH (needed for YT Music)"; return false; }
+			}
+			m_homeScriptPath = m_exeDir + L"ytmusic.mjs";
+			if (GetFileAttributesW(m_homeScriptPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+			{
+				err = L"ytmusic.mjs not found next to MusicPlayer.asi";
+				return false;
+			}
+
+			std::wstring cookiesFile;
+			if (!m_browserName.empty())
+			{
+				// Refresh a Netscape-format cookie dump from the live browser
+				wchar_t tempFile[MAX_PATH];
+				{
+					wchar_t tempPath[MAX_PATH];
+					GetTempPathW(MAX_PATH, tempPath);
+					GetTempFileNameW(tempPath, L"ytcook", 0, tempFile);
+				}
+				// GetTempFileNameW leaves a zero-byte placeholder behind; yt-dlp
+				// refuses to write into an existing non-Netscape file.
+				DeleteFileW(tempFile);
+				std::wstring dumpCmd = L"\"" + m_ytdlpPath + L"\" -s --flat-playlist --no-warnings "
+					L"--cookies-from-browser " + m_browserName + L" --cookies \"" + tempFile + L"\" "
+					L"\"https://www.youtube.com/@RickAstleyYT/videos\"";
+				std::string dumpOut;
+				DWORD dumpCode = 1;
+				RunProcess(dumpCmd, outDir, dumpOut, dumpCode);
+				// Cookies are written to the jar at extraction time, BEFORE the
+				// channel scrape runs; the scrape may exit non-zero (e.g. bot-check
+				// 429) while the jar is still perfectly fresh. Only the jar content
+				// decides usability, the exit code is just diagnostic.
+				bool dumpUsable = GetFileAttributesW(tempFile) != INVALID_FILE_ATTRIBUTES
+					&& CookiesFileUsable(tempFile);
+				if (dumpUsable)
+					cookiesFile = tempFile;
+				else
+					DeleteFileW(tempFile);
+				if (dumpCode != 0 || !dumpUsable)
+					LogMessage(L"YouTube: cookie dump code=%lu usable=%d error=%s", dumpCode, dumpUsable ? 1 : 0,
+						ExtractError(dumpOut).c_str());
+			}
+			if (cookiesFile.empty() && !cookiesPath.empty() && CookiesFileUsable(cookiesPath))
+			{
+				cookiesFile = cookiesPath;
+				LogMessage(L"YouTube: using fallback cookies file (browser dump failed)");
+			}
+			if (cookiesFile.empty())
+			{
+				err = L"no usable YouTube cookies (open Firefox or re-export cookies.txt)";
+				return false;
+			}
+
+			std::wstring nodeCmd = L"\"" + m_nodePath + L"\" \"" + m_homeScriptPath + L"\" \"" + cookiesFile + L"\"";
+			if (!targetUrl.empty())
+				nodeCmd += L" \"" + targetUrl + L"\"";
+			std::string stdoutText;
+			DWORD exitCode = 1;
+			bool procOk = RunProcess(nodeCmd, outDir, stdoutText, exitCode);
+			if (cookiesFile != cookiesPath)
+				DeleteFileW(cookiesFile.c_str());
+			if (procOk && exitCode == 0)
+			{
+				ParseTrackLines(stdoutText, tracks);
+				if (tracks.empty()) { err = L"no entries found in YT Music response"; return false; }
+				bool loggedIn = stdoutText.find("logged_in=1") != std::string::npos;
+				LogMessage(L"YouTube: node scrape: %d entries, session %s", (int)tracks.size(),
+					loggedIn ? L"authenticated" : L"anonymous");
+				return true;
+			}
+			else if (procOk)
+			{
+				err = ExtractError(stdoutText);
+				if (err.empty())
+				{
+					wchar_t buf[64];
+					wsprintfW(buf, L"node script exited with code %lu", exitCode);
+					err = buf;
+				}
+			}
+			else
+			{
+				err = L"could not launch node.exe";
+			}
+			return false;
+		};
+
+		if (doHome)
+		{
+			std::wstring err;
+			std::vector<YtTrack> tracks;
+			runNodeScrape(L"", tracks, err);
+
+			lock.lock();
+			m_scrapeResultReady = true;
+			m_browseTracks = std::move(tracks);
+			m_scrapeError = err;
+			if (!m_browseTracks.empty())
+			{
+				wchar_t buf[64];
+				wsprintfW(buf, L"Ready: %d tracks", (int)m_browseTracks.size());
+				SetStatusLocked(buf);
+				LogMessage(L"YouTube: YT Music home OK: %d tracks", (int)m_browseTracks.size());
+			}
+			else
+			{
+				SetStatusLocked(L"Scrape failed");
+				LogMessage(L"YouTube: YT Music home FAILED error=%s", err.c_str());
+			}
+			continue;
+		}
+
+		if (doScrape)
+		{
+			std::wstring scrapeCmd = L"\"" + m_ytdlpPath + L"\" --flat-playlist --no-warnings "
+				L"--playlist-items 1-500 --print \"%(id)s\t%(title)s\t%(url)s\" ";
+			if (!m_browserName.empty())
+				scrapeCmd += L"--cookies-from-browser " + m_browserName + L" ";
+			else if (!cookiesPath.empty())
+				scrapeCmd += L"--cookies \"" + cookiesPath + L"\" ";
+			scrapeCmd += L"\"" + url + L"\"";
+
+			std::string stdoutText;
+			DWORD exitCode = 1;
+			bool procOk = RunProcess(scrapeCmd, outDir, stdoutText, exitCode);
+
+			std::vector<YtTrack> tracks;
+			std::wstring err;
+			if (procOk && exitCode == 0)
+			{
+				ParseTrackLines(stdoutText, tracks);
+				if (tracks.empty()) err = L"no tracks found in playlist";
+			}
+			else if (procOk)
+			{
+				err = ExtractError(stdoutText);
+				if (err.empty())
+				{
+					wchar_t buf[64];
+					wsprintfW(buf, L"yt-dlp exited with code %lu", exitCode);
+					err = buf;
+				}
+			}
+			else
+			{
+				err = L"could not launch yt-dlp";
+			}
+
+			if (tracks.empty())
+			{
+				// yt-dlp cannot scrape YT Music mix/album playlists (authcheck 400);
+				// fall back to the InnerTube node script for those URLs
+				std::wstring nodeErr;
+				std::vector<YtTrack> nodeTracks;
+				if (runNodeScrape(url, nodeTracks, nodeErr))
+				{
+					tracks = std::move(nodeTracks);
+					err.clear();
+				}
+				else if (err.empty())
+				{
+					err = nodeErr;
+				}
+				else
+				{
+					err += L" | " + nodeErr;
+				}
+			}
+
+			lock.lock();
+			m_scrapeResultReady = true;
+			m_browseTracks = std::move(tracks);
+			m_scrapeError = err;
+			if (!m_browseTracks.empty())
+			{
+				wchar_t buf[64];
+				wsprintfW(buf, L"Ready: %d tracks", (int)m_browseTracks.size());
+				SetStatusLocked(buf);
+				LogMessage(L"YouTube: playlist scrape OK: %d tracks", (int)m_browseTracks.size());
+			}
+			else
+			{
+				SetStatusLocked(L"Scrape failed");
+				LogMessage(L"YouTube: playlist scrape FAILED url=%s error=%s", url.c_str(), err.c_str());
+			}
+			continue;
 		}
 
 		std::wstring fmt = L"ba*";

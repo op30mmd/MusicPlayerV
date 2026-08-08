@@ -31,9 +31,18 @@ enum MenuAction
 	MENU_SHUFFLE,
 	MENU_RELOAD,
 	MENU_PLAYURL,
+	MENU_BROWSE,
+	MENU_HOME,
 	MENU_HIDE,
 	MENU_COUNT
 };
+
+static const int MENU_MODE_MAIN = 0;
+static const int MENU_MODE_BROWSE = 1;
+static int g_menuMode = MENU_MODE_MAIN;
+static std::vector<YtTrack> g_browseTracks;
+static int g_browseIndex = 0;
+static int g_browseOffset = 0;
 
 static std::wstring TrimUrl(const std::wstring& in)
 {
@@ -46,14 +55,14 @@ static std::wstring TrimUrl(const std::wstring& in)
 	return in.substr(start, end - start);
 }
 
-static std::wstring ReadUrlFile()
+static std::wstring ReadUrlFile(const wchar_t* fileName = L"MusicPlayer.url")
 {
 	wchar_t exePath[MAX_PATH];
 	GetModuleFileNameW(nullptr, exePath, MAX_PATH);
 	wchar_t* lastSlash = wcsrchr(exePath, L'\\');
 	if (lastSlash) *(lastSlash + 1) = L'\0';
 
-	std::wstring path = std::wstring(exePath) + L"MusicPlayer.url";
+	std::wstring path = std::wstring(exePath) + fileName;
 	FILE* f = nullptr;
 	if (_wfopen_s(&f, path.c_str(), L"r, ccs=UNICODE") != 0 || !f) return std::wstring();
 
@@ -124,6 +133,30 @@ void PollYouTubeDownloads()
 		LogMessage(L"YouTube: added to library and playing %s", dl.filePath.c_str());
 		UI::DrawNotification(L"MusicPlayer: Now playing downloaded track");
 	}
+}
+
+void PollScrapeResult()
+{
+	std::vector<YtTrack> tracks;
+	std::wstring error;
+	if (!g_youtube.PopScrapeResult(tracks, error)) return;
+	if (tracks.empty())
+	{
+		std::wstring msg = L"MusicPlayer: Playlist scrape failed: " + error;
+		if (msg.size() > 120) msg = msg.substr(0, 120);
+		UI::DrawNotification(msg.c_str());
+		return;
+	}
+
+	g_browseTracks = std::move(tracks);
+	g_browseIndex = 0;
+	g_browseOffset = 0;
+	g_menuMode = MENU_MODE_BROWSE;
+
+	wchar_t msg[128];
+	wsprintfW(msg, L"MusicPlayer: %d tracks loaded", (int)g_browseTracks.size());
+	UI::DrawNotification(msg);
+	LogMessage(L"Browse: entered browse mode with %d tracks", (int)g_browseTracks.size());
 }
 
 void InitMusicPlayer()
@@ -315,6 +348,34 @@ void ActivateMenuAction(int action)
 		break;
 	case MENU_RELOAD: ReloadLibrary(); break;
 	case MENU_PLAYURL: StartYouTubeFromClipboard(); break;
+	case MENU_BROWSE:
+	{
+		std::wstring pUrl = ReadUrlFile(L"MusicPlayer.playlist");
+		if (pUrl.empty())
+		{
+			UI::DrawNotification(L"MusicPlayer: Put a playlist URL in MusicPlayer.playlist");
+			break;
+		}
+		if (!g_youtube.ScrapePlaylist(pUrl))
+		{
+			UI::DrawNotification(L"MusicPlayer: Scrape already running or yt-dlp missing");
+			break;
+		}
+		LogMessage(L"Browse: scraping %s", pUrl.c_str());
+		UI::DrawNotification(L"MusicPlayer: Scraping playlist...");
+		break;
+	}
+	case MENU_HOME:
+	{
+		if (!g_youtube.ScrapeHome())
+		{
+			UI::DrawNotification(L"MusicPlayer: Scrape already running or yt-dlp missing");
+			break;
+		}
+		LogMessage(L"Browse: scraping YT Music home");
+		UI::DrawNotification(L"MusicPlayer: Scraping YT Music home...");
+		break;
+	}
 	case MENU_HIDE:
 		g_showUI = false;
 		g_modConfig.showUI = g_showUI;
@@ -382,22 +443,72 @@ void ProcessControls()
 
 	if (g_showUI)
 	{
-		if (IsKeyJustUp(VK_UP))
+		if (g_menuMode == MENU_MODE_BROWSE)
 		{
-			g_menuIndex = (g_menuIndex - 1 + MENU_COUNT) % MENU_COUNT;
-			LogMessage(L"Menu: up -> %d", g_menuIndex);
-		}
+			int total = (int)g_browseTracks.size();
+			if (IsKeyJustUp(VK_UP))
+			{
+				if (g_browseIndex > 0) g_browseIndex--;
+				else if (total > 0) g_browseIndex = total - 1;
+				LogMessage(L"Browse: up -> %d", g_browseIndex);
+			}
 
-		if (IsKeyJustUp(VK_DOWN))
-		{
-			g_menuIndex = (g_menuIndex + 1) % MENU_COUNT;
-			LogMessage(L"Menu: down -> %d", g_menuIndex);
-		}
+			if (IsKeyJustUp(VK_DOWN))
+			{
+				g_browseIndex = (g_browseIndex + 1) % (total + 1);
+				LogMessage(L"Browse: down -> %d", g_browseIndex);
+			}
 
-		if (IsKeyJustUp(VK_RETURN) || IsKeyJustUp(VK_SPACE))
+			if (IsKeyJustUp(VK_BACK))
+			{
+				g_menuMode = MENU_MODE_MAIN;
+				LogMessage(L"Browse: backspace -> main menu");
+			}
+
+			if (IsKeyJustUp(VK_RETURN) || IsKeyJustUp(VK_SPACE))
+			{
+				if (g_browseIndex >= total)
+				{
+					g_menuMode = MENU_MODE_MAIN;
+					LogMessage(L"Browse: back to main menu");
+				}
+				else
+				{
+					const YtTrack& tr = g_browseTracks[g_browseIndex];
+					LogMessage(L"Browse: select %s (%s)", tr.title.c_str(), tr.type == 1 ? L"playlist" : L"video");
+					if (tr.type == 1)
+					{
+						if (!g_youtube.ScrapePlaylist(tr.url))
+							UI::DrawNotification(L"MusicPlayer: Scrape already running");
+						else
+							UI::DrawNotification(L"MusicPlayer: Opening playlist...");
+					}
+					else if (!g_youtube.StartDownload(tr.url))
+						UI::DrawNotification(L"MusicPlayer: Download already in progress");
+					else
+						UI::DrawNotification(L"MusicPlayer: Downloading selected track...");
+				}
+			}
+		}
+		else
 		{
-			LogMessage(L"Menu: activate item %d", g_menuIndex);
-			ActivateMenuAction(g_menuIndex);
+			if (IsKeyJustUp(VK_UP))
+			{
+				g_menuIndex = (g_menuIndex - 1 + MENU_COUNT) % MENU_COUNT;
+				LogMessage(L"Menu: up -> %d", g_menuIndex);
+			}
+
+			if (IsKeyJustUp(VK_DOWN))
+			{
+				g_menuIndex = (g_menuIndex + 1) % MENU_COUNT;
+				LogMessage(L"Menu: down -> %d", g_menuIndex);
+			}
+
+			if (IsKeyJustUp(VK_RETURN) || IsKeyJustUp(VK_SPACE))
+			{
+				LogMessage(L"Menu: activate item %d", g_menuIndex);
+				ActivateMenuAction(g_menuIndex);
+			}
 		}
 
 		if (IsKeyJustUp(VK_LEFT))
@@ -431,9 +542,17 @@ void DrawMenuLine(float menuLeft, float lineTop, float lineHeight, const wchar_t
 	}
 }
 
+void DrawBrowseUI();
+
 void DrawUI()
 {
 	if (!g_showUI || !g_initialized) return;
+
+	if (g_menuMode == MENU_MODE_BROWSE)
+	{
+		DrawBrowseUI();
+		return;
+	}
 
 	g_frameCounter++;
 	if (g_frameCounter % 180 == 0)
@@ -511,6 +630,12 @@ void DrawUI()
 		case MENU_PLAYURL:
 			wsprintfW(itemText, L"Play YouTube URL (F12)");
 			break;
+		case MENU_BROWSE:
+			wsprintfW(itemText, L"Browse YouTube Playlist");
+			break;
+		case MENU_HOME:
+			wsprintfW(itemText, L"Browse YT Music Home");
+			break;
 		case MENU_HIDE:
 			wsprintfW(itemText, L"Hide UI (F8)");
 			break;
@@ -521,6 +646,71 @@ void DrawUI()
 
 	lineTop += lineHeight * 0.3f;
 	UI::DrawText(menuLeft + 0.01f, lineTop + 0.004f, L"Up/Down: move | Enter: select | L/R: volume", 0.2f, 150, 150, 150);
+}
+
+void DrawBrowseUI()
+{
+	if (!g_showUI || !g_initialized) return;
+
+	const float menuLeft = 0.015f;
+	const float menuTop = 0.05f;
+	const float lineHeight = 0.028f;
+	const int visible = 9;
+
+	int total = (int)g_browseTracks.size();
+	if (g_browseIndex < g_browseOffset) g_browseOffset = g_browseIndex;
+	if (g_browseIndex >= g_browseOffset + visible) g_browseOffset = g_browseIndex - visible + 1;
+
+	std::wstring ytStatus = g_youtube.GetStatusText();
+
+	float bgHeight = lineHeight * 0.72f
+		+ lineHeight * 1.15f
+		+ (ytStatus.empty() ? 0.0f : lineHeight * 1.2f)
+		+ lineHeight * (float)(visible + 1)
+		+ lineHeight * 1.3f
+		+ lineHeight * 0.3f;
+	UI::DrawRect(menuLeft, menuTop, 0.3f, bgHeight, 0, 0, 0, 220);
+
+	float lineTop = menuTop + lineHeight * 0.72f;
+
+	wchar_t hdr[64];
+	wsprintfW(hdr, L"[YouTube Music] - %d tracks", total);
+	UI::DrawText(menuLeft + 0.01f, lineTop + 0.004f, hdr, 0.3f, 0, 200, 255);
+	lineTop += lineHeight * 1.15f;
+
+	if (!ytStatus.empty())
+	{
+		UI::DrawText(menuLeft + 0.01f, lineTop + 0.004f, ytStatus.c_str(), 0.22f, 255, 200, 100);
+		lineTop += lineHeight * 1.2f;
+	}
+
+	for (int i = 0; i < visible; i++)
+	{
+		int idx = g_browseOffset + i;
+		if (idx >= total) break;
+		bool active = (idx == g_browseIndex);
+		wchar_t title[48];
+		const wchar_t* src = g_browseTracks[idx].title.c_str();
+		if (g_browseTracks[idx].type == 1)
+		{
+			wcsncpy_s(title, L"[Mix] ", 46);
+			wcsncpy_s(title + 6, 48 - 6, src, 40);
+			if (wcslen(src) > 40) title[45] = L'~';
+		}
+		else
+		{
+			wcsncpy_s(title, src, 46);
+			if (wcslen(src) > 46) title[45] = L'~';
+		}
+		DrawMenuLine(menuLeft, lineTop, lineHeight, title, active, 255, 255, 255);
+		lineTop += lineHeight;
+	}
+
+	bool backActive = (g_browseIndex == total);
+	DrawMenuLine(menuLeft, lineTop, lineHeight, L"<- Back to menu", backActive, 255, 255, 255);
+	lineTop += lineHeight * 1.3f;
+
+	UI::DrawText(menuLeft + 0.01f, lineTop + 0.004f, L"Enter: play | [Mix]: open list | Backspace: back | L/R: volume", 0.2f, 150, 150, 150);
 }
 
 void DisableGameControlsForMenu()
@@ -602,6 +792,7 @@ void ProcessMusicPlayer()
 
 	g_audioEngine.Update();
 	PollYouTubeDownloads();
+	PollScrapeResult();
 	DrawUI();
 }
 
