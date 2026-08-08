@@ -1,0 +1,79 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  TAG_NAME: v1.0.${{ github.run_number }}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download ScriptHookV SDK
+        shell: pwsh
+        run: |
+          $sdkParent = Split-Path $env:GITHUB_WORKSPACE -Parent
+          $sdkDir = Join-Path $sdkParent "ScriptHookV_SDK"
+          New-Item -ItemType Directory -Force -Path $sdkDir | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP "ScriptHookV_SDK.zip"
+          Invoke-WebRequest -Uri "https://www.dev-c.com/files/ScriptHookV_SDK_1.0.617.1a.zip" `
+            -Headers @{ "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"; "Referer" = "https://www.dev-c.com/" } `
+            -OutFile $zip
+          Expand-Archive -LiteralPath $zip -DestinationPath $sdkDir -Force
+
+      - name: Download and extract FFmpeg
+        shell: pwsh
+        run: |
+          $depsDir = Join-Path $env:GITHUB_WORKSPACE "deps\ffmpeg"
+          New-Item -ItemType Directory -Force -Path $depsDir | Out-Null
+          $ffmpeg7z = Join-Path $env:RUNNER_TEMP "ffmpeg-release-full-shared.7z"
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z" -OutFile $ffmpeg7z
+          & "C:\Program Files\7-Zip\7z.exe" x $ffmpeg7z "-o$depsDir" -y | Out-Null
+          $extracted = Get-ChildItem $depsDir -Directory | Select-Object -First 1
+          if (-not $extracted) { throw "FFmpeg extraction failed" }
+          $expected = Join-Path $depsDir "ffmpeg-9.0-full_build-shared"
+          if ($extracted.FullName -ne $expected) { Move-Item $extracted.FullName $expected }
+
+      - name: Build (Release x64)
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          if (-not $vsPath) { throw "Visual Studio not found" }
+          $msbuild = Join-Path $vsPath "MSBuild\Current\Bin\MSBuild.exe"
+          & $msbuild "$env:GITHUB_WORKSPACE\MusicPlayer.vcxproj" /p:Configuration=Release /p:Platform=x64 /t:Rebuild /v:minimal
+          if ($LASTEXITCODE -ne 0) { throw "MSBuild failed" }
+
+      - name: Package release zip
+        shell: pwsh
+        run: |
+          $buildDir = Join-Path $env:GITHUB_WORKSPACE "build"
+          if (-not (Test-Path (Join-Path $buildDir "MusicPlayer.asi"))) { throw "MusicPlayer.asi missing" }
+          $staging = Join-Path $env:RUNNER_TEMP "staging"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item "$buildDir\*" $staging -Exclude obj -Force
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE "README.md") $staging -Force
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE "LICENSE") $staging -Force
+          $zip = Join-Path $env:GITHUB_WORKSPACE "MusicPlayer-$env:TAG_NAME.zip"
+          Compress-Archive -Path "$staging\*" -DestinationPath $zip -Force
+          Write-Output "Package: $zip"
+
+      - name: Create tag and release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = Join-Path $env:GITHUB_WORKSPACE "MusicPlayer-$env:TAG_NAME.zip"
+          gh release create $env:TAG_NAME $zip --generate-notes --title "MusicPlayer $env:TAG_NAME" 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Release already exists, uploading asset to existing release"
+            gh release upload $env:TAG_NAME $zip --clobber
+          }
