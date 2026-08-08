@@ -1,0 +1,9 @@
+# Visual Studio
+.vs/
+*.user
+
+# Build output
+build/
+
+# FFmpeg dev package (download from https://www.gyan.dev/ffmpeg/builds/ - ffmpeg-release-full-shared)
+deps/
