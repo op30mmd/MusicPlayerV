@@ -7,9 +7,14 @@ An in-game music player for GTA V. Decodes MP3, WAV, FLAC, OGG, WMA, AAC, M4A fi
 - Full-screen-transparent menu UI with keyboard navigation (F8 to toggle)
 - Instant track switching (next track pre-decoded in the background while the current one plays)
 - Auto-advance to the next track on natural end; unsupported/corrupt tracks are skipped automatically
+- **Repeat modes**: Off, Repeat All, Repeat One — persisted in `MusicPlayer.ini` (menu item cycles through them)
+- **Playback queue for YouTube tracks**: queue tracks from browse mode, they download chained in the background and play back-to-back when the current track ends
+- **No freezes**: queued/downloaded YouTube tracks are decoded on the background thread with preloading, just like the local library — the main queue resumes where it was interrupted when the queue is left (or skipped manually)
+- **Content caching**: never re-downloads a YouTube URL you've played before (`MusicPlayerCache.txt` maps URL -> audio file); Download failures don't pollute the cache
+- **Scraper caching**: playlist/album/mix and home feeds are cached in memory (10-30 min TTL), so re-opening a list is instant
 - Vehicle radio is forced off automatically while music is playing (restored when playback stops)
 - Phone / arrow-key game controls are blocked while the menu is visible
-- Playback survives menu open/close; volume, shuffle and UI state persist in `MusicPlayer.ini`
+- Playback survives menu open/close; volume, shuffle, repeat and UI state persist in `MusicPlayer.ini`
 - Play YouTube audio: copy a video URL, press F12 (or use the menu item) — the mod downloads the best audio stream via `yt-dlp.exe` and plays it through the normal pipeline
 
 ## Controls
@@ -27,6 +32,8 @@ An in-game music player for GTA V. Decodes MP3, WAV, FLAC, OGG, WMA, AAC, M4A fi
 | Arrow Up / Down | Navigate menu (menu visible) |
 | Enter / Space | Activate menu item (menu visible) |
 | Arrow Left / Right | Volume down / up (menu visible) |
+| E | Add the highlighted track to the YouTube queue (browse mode) |
+| Backspace | Leave browse mode / go back to the main menu |
 
 When the menu is hidden, all arrow/Enter/Space keys belong to the game.
 
@@ -39,11 +46,14 @@ Edit `MusicPlayer.ini` in your GTA V folder:
 MusicDirectory=C:\Users\YourName\Music
 Volume=50
 Shuffle=0
+Repeat=1
 ShowUI=1
 YtDlpJsRuntime=node
 ```
 
 If `MusicDirectory` is empty, the Windows Music library folder is used.
+
+`Repeat`: `0` = off, `1` = repeat all (default), `2` = repeat one. It can also be changed from the in-game menu (the "Repeat" item cycles Off -> All -> One).
 
 ## Playing YouTube audio
 
@@ -58,15 +68,37 @@ Notes:
 - No ffmpeg.exe is needed: the mod requests the best audio-only stream (`-f ba*`), which the bundled FFmpeg DLLs decode directly.
 - Downloaded files stay in the YouTube folder; press F5 to reload only local library files (the folder is not scanned automatically).
 
-## Browsing a YouTube Music playlist
+## Browsing YouTube Music (playlists, mixes, home feed)
 
-Put a playlist, album, or channel URL in `MusicPlayer.playlist` (next to the `.asi`), then select **"Browse YouTube Playlist"** in the menu. The mod scrapes up to 500 track titles via `yt-dlp --flat-playlist` (nothing is downloaded yet) and switches the menu into browse mode:
+Two entry points in the menu:
 
-- **Up / Down** — move through the track list (scrolls for long playlists)
+- **"Browse YouTube Playlist"** — put a playlist, album, mix or channel URL in `MusicPlayer.playlist` (next to the `.asi`), or press Enter on any `[Mix]` entry you encounter while browsing.
+- **"Browse YT Music Home"** — scrapes your personal home feed when you're logged in (own playlists like "Liked Music" and "My Supermix" included, plus rotating sections like "Listen again" and "Forgotten favorites"). If the feed isn't personalized, it still returns the generic top music.
+
+Track lists are scraped via `yt-dlp --flat-playlist` (with an InnerTube fallback script `ytmusic.mjs` for YT Music mix/album URLs, which yt-dlp can't read) and the menu switches into browse mode:
+
+- **Up / Down** — move through the track list (scrolls for long feeds)
 - **Enter** — download & play the selected track
-- **<- Back to menu** — return to the main menu
+- **E** — add the selected track to the **YouTube queue** (`[Mix]` entries must be opened first)
+- **Backspace** — return to the main menu
+- **<- Back to menu** — same as Backspace
 
-The same cookie source as downloads is used, so private/liked playlists from your logged-in browser work.
+The main menu shows a live `YouTube queue: N in line (M ready)` line, and the **"Clear YouTube queue"** item drops the queue and returns to the main queue immediately.
+
+### How the queue behaves
+
+- Queued tracks download **chained in the background** (no "already downloading" rejection, up to 64); each becomes playable as soon as it arrives.
+- When the current track ends, the next ready queued track plays — decoded on the background thread with the **next one preloaded**, so switches are as instant as the main queue.
+- When the queue runs out, the **main queue resumes exactly where it was interrupted** (track + position); with Repeat All the queue itself loops until you skip or clear it. A manual Next press always leaves the loop.
+- Every track you've played/queued (e.g. same video via F12) is served from the **content cache** instead of downloading again — no network, no bloat.
+
+## Caching
+
+- **Content cache** (`MusicPlayerCache.txt`, next to the `.asi`): maps YouTube URLs to already-downloaded audio files. Requesting a URL that's in the cache and still on disk plays immediately — yt-dlp is never invoked. Entries with missing files are pruned automatically (kept at most 512).
+- **Scraper cache** (in memory): track lists from playlist/mix scrapes (30 min) and the home feed (10 min) are served from RAM, so re-opening a list you already browsed is instant.
+- **Preload cache**: the audio engine decodes the *next* queued or library track in the background while the current one plays, so every track switch (main queue or YouTube queue) is instant with no re-decoding.
+
+Clearing `MusicPlayerCache.txt` (while GTA V is closed) or deleting downloaded files forces a fresh download.
 
 ## YouTube cookies (age-restricted / logged-in downloads)
 
