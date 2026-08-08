@@ -62,6 +62,7 @@
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\script.cpp" />
     <ClCompile Include="src\ui.cpp" />
+    <ClCompile Include="src\ytdlp.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\audio.h" />
@@ -70,6 +71,7 @@
     <ClInclude Include="src\log.h" />
     <ClInclude Include="src\script.h" />
     <ClInclude Include="src\ui.h" />
+    <ClInclude Include="src\ytdlp.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

@@ -2,6 +2,7 @@
 #include "script.h"
 #include "ui.h"
 #include "log.h"
+#include "ytdlp.h"
 #include <algorithm>
 #include <ctime>
 #include <shlobj.h>
@@ -11,6 +12,8 @@ ModConfig g_modConfig;
 std::vector<std::wstring> g_trackList;
 bool g_initialized = false;
 bool g_showUI = true;
+
+YouTubeManager g_youtube;
 
 static float g_volume = 0.5f;
 static std::wstring g_currentTrackName;
@@ -27,9 +30,101 @@ enum MenuAction
 	MENU_VOL_UP,
 	MENU_SHUFFLE,
 	MENU_RELOAD,
+	MENU_PLAYURL,
 	MENU_HIDE,
 	MENU_COUNT
 };
+
+static std::wstring TrimUrl(const std::wstring& in)
+{
+	size_t start = 0;
+	size_t end = in.size();
+	while (start < end && (in[start] == L' ' || in[start] == L'\t' || in[start] == L'\r' || in[start] == L'\n'))
+		start++;
+	while (end > start && (in[end - 1] == L' ' || in[end - 1] == L'\t' || in[end - 1] == L'\r' || in[end - 1] == L'\n'))
+		end--;
+	return in.substr(start, end - start);
+}
+
+static std::wstring ReadUrlFile()
+{
+	wchar_t exePath[MAX_PATH];
+	GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+	wchar_t* lastSlash = wcsrchr(exePath, L'\\');
+	if (lastSlash) *(lastSlash + 1) = L'\0';
+
+	std::wstring path = std::wstring(exePath) + L"MusicPlayer.url";
+	FILE* f = nullptr;
+	if (_wfopen_s(&f, path.c_str(), L"r, ccs=UNICODE") != 0 || !f) return std::wstring();
+
+	wchar_t buf[2048] = { 0 };
+	if (!fgetws(buf, 2048, f))
+	{
+		fclose(f);
+		return std::wstring();
+	}
+	fclose(f);
+	return TrimUrl(buf);
+}
+
+void StartYouTubeFromClipboard()
+{
+	if (!g_youtube.IsAvailable())
+	{
+		LogMessage(L"YouTube: start requested but yt-dlp.exe not found");
+		UI::DrawNotification(L"MusicPlayer: yt-dlp.exe not found! Copy it next to MusicPlayer.asi");
+		return;
+	}
+
+	std::wstring url = YouTubeManager::GetClipboardUrl();
+	if (url.empty())
+	{
+		url = ReadUrlFile();
+		LogMessage(L"YouTube: clipboard empty, checked MusicPlayer.url fallback (%d)", url.empty() ? 0 : 1);
+	}
+	if (url.empty())
+	{
+		UI::DrawNotification(L"MusicPlayer: No URL in clipboard or MusicPlayer.url");
+		return;
+	}
+
+	if (!g_youtube.StartDownload(url))
+	{
+		UI::DrawNotification(L"MusicPlayer: Download already in progress");
+		return;
+	}
+
+	LogMessage(L"YouTube: queued %s", url.c_str());
+	UI::DrawNotification(L"MusicPlayer: Downloading YouTube audio...");
+}
+
+void PollYouTubeDownloads()
+{
+	YtDownload dl;
+	while (g_youtube.PopResult(dl))
+	{
+		if (!dl.ok)
+		{
+			std::wstring msg = L"MusicPlayer: YouTube download failed: " + dl.error;
+			if (msg.size() > 120) msg = msg.substr(0, 120);
+			UI::DrawNotification(msg.c_str());
+			LogMessage(L"YouTube: failed notification: %s", msg.c_str());
+			continue;
+		}
+
+		g_trackList.push_back(dl.filePath);
+		g_audioEngine.SetPlayQueue(g_trackList.data(), (int)g_trackList.size());
+		g_audioEngine.SetCurrentIndex((int)g_trackList.size() - 1);
+		g_audioEngine.PlayQueue();
+
+		g_currentTrackName = dl.filePath;
+		size_t pos = g_currentTrackName.find_last_of(L"\\/");
+		if (pos != std::wstring::npos)
+			g_currentTrackName = g_currentTrackName.substr(pos + 1);
+		LogMessage(L"YouTube: added to library and playing %s", dl.filePath.c_str());
+		UI::DrawNotification(L"MusicPlayer: Now playing downloaded track");
+	}
+}
 
 void InitMusicPlayer()
 {
@@ -65,9 +160,24 @@ void InitMusicPlayer()
 	g_trackList = ScanMusicFiles(g_modConfig.musicDirectory);
 	LogMessage(L"InitMusicPlayer: found %d tracks", (int)g_trackList.size());
 
+	std::wstring ytDir = std::wstring(g_modConfig.musicDirectory) + L"\\YouTube";
+	g_youtube.Initialize(exePath, ytDir);
+	LogMessage(L"InitMusicPlayer: youtube available=%d dir=%s", g_youtube.IsAvailable() ? 1 : 0, ytDir.c_str());
+
+	if (!g_audioEngine.Initialize())
+	{
+		LogMessage(L"InitMusicPlayer: audio engine init FAILED");
+		UI::DrawNotification(L"MusicPlayer: Failed to initialize audio engine!");
+		return;
+	}
+	LogMessage(L"InitMusicPlayer: audio engine OK");
+	g_audioEngine.SetVolume(g_volume);
+
 	if (g_trackList.empty())
 	{
-		UI::DrawNotification(L"MusicPlayer: No music files found!");
+		LogMessage(L"InitMusicPlayer: no local tracks, YouTube mode only");
+		UI::DrawNotification(L"MusicPlayer: No music files found! Copy a YouTube URL and press F12");
+		g_initialized = true;
 		return;
 	}
 
@@ -78,15 +188,6 @@ void InitMusicPlayer()
 		LogMessage(L"InitMusicPlayer: shuffled");
 	}
 
-	if (!g_audioEngine.Initialize())
-	{
-		LogMessage(L"InitMusicPlayer: audio engine init FAILED");
-		UI::DrawNotification(L"MusicPlayer: Failed to initialize audio engine!");
-		return;
-	}
-	LogMessage(L"InitMusicPlayer: audio engine OK");
-
-	g_audioEngine.SetVolume(g_volume);
 	g_audioEngine.SetPlayQueue(g_trackList.data(), (int)g_trackList.size());
 
 	int firstOk = -1;
@@ -102,7 +203,8 @@ void InitMusicPlayer()
 	if (firstOk == -1)
 	{
 		LogMessage(L"InitMusicPlayer: no loadable track found");
-		UI::DrawNotification(L"MusicPlayer: No supported tracks found!");
+		UI::DrawNotification(L"MusicPlayer: No supported tracks found! Copy a YouTube URL and press F12");
+		g_initialized = true;
 		return;
 	}
 
@@ -127,6 +229,7 @@ void InitMusicPlayer()
 
 void ShutdownMusicPlayer()
 {
+	g_youtube.Shutdown();
 	g_audioEngine.Shutdown();
 }
 
@@ -211,6 +314,7 @@ void ActivateMenuAction(int action)
 		UI::DrawNotification(g_modConfig.shuffle ? L"MusicPlayer: Shuffle ON (applies on reload)" : L"MusicPlayer: Shuffle OFF");
 		break;
 	case MENU_RELOAD: ReloadLibrary(); break;
+	case MENU_PLAYURL: StartYouTubeFromClipboard(); break;
 	case MENU_HIDE:
 		g_showUI = false;
 		g_modConfig.showUI = g_showUI;
@@ -270,6 +374,12 @@ void ProcessControls()
 		VolumeUp();
 	}
 
+	if (IsKeyJustUp(VK_F12))
+	{
+		LogMessage(L"F12 pressed");
+		StartYouTubeFromClipboard();
+	}
+
 	if (g_showUI)
 	{
 		if (IsKeyJustUp(VK_UP))
@@ -312,7 +422,7 @@ void DrawMenuLine(float menuLeft, float lineTop, float lineHeight, const wchar_t
 {
 	if (active)
 	{
-		UI::DrawRect(menuLeft, lineTop, 0.28f, lineHeight, 218, 242, 216, 255);
+		UI::DrawRect(menuLeft, lineTop, 0.3f, lineHeight, 218, 242, 216, 255);
 		UI::DrawText(menuLeft + 0.01f, lineTop + 0.004f, text, 0.28f, 0, 0, 0);
 	}
 	else
@@ -332,11 +442,21 @@ void DrawUI()
 	}
 
 	const float menuLeft = 0.015f;
+	const float menuTop = 0.05f;
 	const float lineHeight = 0.028f;
-	float lineTop = 0.07f;
 
-	// 3 info lines + 8 items + 1 hint line, plus margins
-	UI::DrawRect(menuLeft, 0.05f, 0.3f, lineHeight * 14.2f, 0, 0, 0, 220);
+	std::wstring ytStatus = g_youtube.GetStatusText();
+
+	// Dynamic height: top pad + 3 info lines + optional yt line + items + hint + bottom pad
+	float bgHeight = lineHeight * 0.72f
+		+ lineHeight * (1.15f + 1.15f + 1.2f)
+		+ (ytStatus.empty() ? 0.0f : lineHeight * 1.2f)
+		+ lineHeight * (float)MENU_COUNT
+		+ lineHeight * 1.3f
+		+ lineHeight * 0.3f;
+	UI::DrawRect(menuLeft, menuTop, 0.3f, bgHeight, 0, 0, 0, 220);
+
+	float lineTop = menuTop + lineHeight * 0.72f;
 
 	UI::DrawText(menuLeft + 0.01f, lineTop + 0.004f, L"[MusicPlayer]", 0.3f, 0, 200, 255);
 	lineTop += lineHeight * 1.15f;
@@ -354,6 +474,12 @@ void DrawUI()
 	UI::DrawText(menuLeft + 0.01f, lineTop + 0.004f, statusText, 0.25f,
 		g_audioEngine.IsPlaying() ? 0 : 180, g_audioEngine.IsPlaying() ? 255 : 180, 0);
 	lineTop += lineHeight * 1.2f;
+
+	if (!ytStatus.empty())
+	{
+		UI::DrawText(menuLeft + 0.01f, lineTop + 0.004f, ytStatus.c_str(), 0.22f, 255, 200, 100);
+		lineTop += lineHeight * 1.2f;
+	}
 
 	wchar_t itemText[64];
 	for (int i = 0; i < MENU_COUNT; i++)
@@ -381,6 +507,9 @@ void DrawUI()
 			break;
 		case MENU_RELOAD:
 			wsprintfW(itemText, L"Reload Library");
+			break;
+		case MENU_PLAYURL:
+			wsprintfW(itemText, L"Play YouTube URL (F12)");
 			break;
 		case MENU_HIDE:
 			wsprintfW(itemText, L"Hide UI (F8)");
@@ -472,6 +601,7 @@ void ProcessMusicPlayer()
 	HandleVehicleRadio();
 
 	g_audioEngine.Update();
+	PollYouTubeDownloads();
 	DrawUI();
 }
 
